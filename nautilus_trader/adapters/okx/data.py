@@ -150,31 +150,28 @@ class OKXDataClient(LiveMarketDataClient):
 
         instruments = self.instrument_provider.instruments_pyo3()
 
-        # Connect public WebSocket client (non-blocking)
-        future = asyncio.ensure_future(
-            self._ws_client.connect(
-                instruments=instruments,
-                callback=self._handle_msg,
-            ),
+        await self._ws_client.connect(
+            instruments=instruments,
+            callback=self._handle_msg,
         )
-        self._ws_client_futures.add(future)
+
+        # Wait for connection to be established
+        await self._ws_client.wait_until_active(timeout_secs=10.0)
         self._log.info(f"Connected to public websocket {self._ws_client.url}", LogColor.BLUE)
 
-        # Connect business WebSocket client
-        business_future = asyncio.ensure_future(
-            self._ws_business_client.connect(
-                instruments=instruments,
-                callback=self._handle_msg,
-            ),
+        await self._ws_business_client.connect(
+            instruments=instruments,
+            callback=self._handle_msg,
         )
-        self._ws_business_client_futures.add(business_future)
+
+        # Wait for connection to be established
+        await self._ws_client.wait_until_active(timeout_secs=10.0)
         self._log.info(
             f"Connected to business websocket {self._ws_business_client.url}",
             LogColor.BLUE,
         )
         self._log.info("OKX API key authenticated", LogColor.GREEN)
 
-        # Subscribe to instruments for updates
         for instrument_type in self._instrument_provider.instrument_types:
             await self._ws_client.subscribe_instruments(instrument_type)
 
@@ -223,12 +220,6 @@ class OKXDataClient(LiveMarketDataClient):
             self._http_client.add_instrument(inst)
 
         self._log.debug("Cached instruments", LogColor.MAGENTA)
-
-    def _cache_instrument(self, instrument: Instrument) -> None:
-        self._instrument_provider.add(instrument)
-        self._http_client.add_instrument(instrument)
-
-        self._log.debug(f"Cached instrument {instrument.id}", LogColor.MAGENTA)
 
     def _send_all_instruments_to_data_engine(self) -> None:
         for currency in self._instrument_provider.currencies().values():
@@ -311,18 +302,27 @@ class OKXDataClient(LiveMarketDataClient):
 
     async def _unsubscribe_order_book_deltas(self, command: UnsubscribeOrderBook) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+        active_channels = self._ws_client.get_subscriptions(pyo3_instrument_id)
 
-        if self._config.vip_level and self._config.vip_level >= 5:
-            await self._ws_client.unsubscribe_book_l2_tbt(pyo3_instrument_id)
-        elif self._config.vip_level and self._config.vip_level >= 4:
-            await self._ws_client.unsubscribe_book_l2_tbt(pyo3_instrument_id)
-            await self._ws_client.unsubscribe_book50_l2_tbt(pyo3_instrument_id)
-        else:
-            await self._ws_client.unsubscribe_book(pyo3_instrument_id)
+        tasks = []
+
+        for channel in active_channels:
+            if channel == "books":
+                tasks.append(self._ws_client.unsubscribe_book(pyo3_instrument_id))
+            elif channel == "books50-l2-tbt":
+                tasks.append(self._ws_client.unsubscribe_book50_l2_tbt(pyo3_instrument_id))
+            elif channel == "books-l2-tbt":
+                tasks.append(self._ws_client.unsubscribe_book_l2_tbt(pyo3_instrument_id))
+
+        if tasks:
+            await asyncio.gather(*tasks)
 
     async def _unsubscribe_order_book_snapshots(self, command: UnsubscribeOrderBook) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
-        await self._ws_client.unsubscribe_book_depth5(pyo3_instrument_id)
+        active_channels = self._ws_client.get_subscriptions(pyo3_instrument_id)
+
+        if "books5" in active_channels:
+            await self._ws_client.unsubscribe_book_depth5(pyo3_instrument_id)
 
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)

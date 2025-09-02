@@ -20,12 +20,7 @@
 //! (when credentials are provided), constructs valid HTTP requests
 //! using the [`HttpClient`], and parses the responses back into structured data or a [`BitmexHttpError`].
 //!
-//! # Quick links to official docs
-//! | Domain                               | BitMEX reference                                                          |
-//! |--------------------------------------|---------------------------------------------------------------------------|
-//! | Market data                          | <https://www.bitmex.com/api/explorer/#/default>                          |
-//! | Account & positions                  | <https://www.bitmex.com/api/explorer/#/default>                          |
-//! | Order management                     | <https://www.bitmex.com/api/explorer/#/default>                          |
+//! BitMEX API reference <https://www.bitmex.com/api/explorer/#/default>.
 
 use std::{
     collections::HashMap,
@@ -33,37 +28,48 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
+use ahash::AHashMap;
 use chrono::Utc;
 use nautilus_core::{consts::NAUTILUS_USER_AGENT, env::get_env_var};
 use nautilus_model::{
-    identifiers::Symbol,
+    enums::{OrderSide, OrderType, TimeInForce},
+    events::AccountState,
+    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
     instruments::{Instrument as InstrumentTrait, InstrumentAny},
+    reports::OrderStatusReport,
+    types::{Price, Quantity},
 };
 use nautilus_network::{http::HttpClient, ratelimiter::quota::Quota};
-use reqwest::{Method, StatusCode};
+use reqwest::{Method, StatusCode, header::USER_AGENT};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use ustr::Ustr;
 
 use super::{
     error::{BitmexErrorResponse, BitmexHttpError},
-    models::{Execution, Instrument, Order, Position, Trade, Wallet},
+    models::{
+        BitmexExecution, BitmexInstrument, BitmexMargin, BitmexOrder, BitmexPosition, BitmexTrade,
+        BitmexWallet,
+    },
     query::{
-        DeleteOrderParams, GetExecutionParams, GetOrderParams, GetPositionParams, GetTradeParams,
-        PostOrderParams, PutOrderParams,
+        DeleteAllOrdersParams, DeleteOrderParams, GetExecutionParams, GetOrderParams,
+        GetPositionParams, GetTradeParams, PostOrderParams, PutOrderParams,
     },
 };
 use crate::{
-    consts::{BITMEX_HTTP_TESTNET_URL, BITMEX_HTTP_URL},
-    credential::Credential,
+    common::{
+        consts::{BITMEX_HTTP_TESTNET_URL, BITMEX_HTTP_URL},
+        credential::Credential,
+    },
+    websocket::messages::BitmexMarginMsg,
 };
 
 /// Default BitMEX REST API rate limit.
 ///
 /// BitMEX rate limits are complex and vary by endpoint:
-/// - Public endpoints: 150 requests per 5 minutes
-/// - Private endpoints: 300 requests per 5 minutes
-/// - Order placement: 200 requests per minute
+/// - Public endpoints: 150 requests per 5 minutes.
+/// - Private endpoints: 300 requests per 5 minutes.
+/// - Order placement: 200 requests per minute.
 ///
 /// We use a conservative 10 requests per second as a general limit.
 pub static BITMEX_REST_QUOTA: LazyLock<Quota> =
@@ -138,7 +144,7 @@ impl BitmexHttpInnerClient {
     }
 
     fn default_headers() -> HashMap<String, String> {
-        HashMap::from([("user-agent".to_string(), NAUTILUS_USER_AGENT.to_string())])
+        HashMap::from([(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())])
     }
 
     fn sign_request(
@@ -160,13 +166,13 @@ impl BitmexHttpInnerClient {
         let full_path = if endpoint.starts_with("/api/v1") {
             endpoint.to_string()
         } else {
-            format!("/api/v1{}", endpoint)
+            format!("/api/v1{endpoint}")
         };
 
-        tracing::debug!("Signing with body: '{}'", body_str);
+        tracing::debug!("Signing with body: '{body_str}'");
         tracing::debug!("Method: {}", method.as_str());
-        tracing::debug!("Path: {}", full_path);
-        tracing::debug!("Expires: {}", expires);
+        tracing::debug!("Path: {full_path}");
+        tracing::debug!("Expires: {expires}");
 
         let signature = credential.sign(method.as_str(), &full_path, expires, &body_str);
 
@@ -213,10 +219,6 @@ impl BitmexHttpInnerClient {
         }
     }
 
-    // ========================================================================
-    // Raw HTTP API methods
-    // ========================================================================
-
     /// Get all instruments.
     ///
     /// # Errors
@@ -225,7 +227,7 @@ impl BitmexHttpInnerClient {
     pub async fn http_get_instruments(
         &self,
         active_only: bool,
-    ) -> Result<Vec<Instrument>, BitmexHttpError> {
+    ) -> Result<Vec<BitmexInstrument>, BitmexHttpError> {
         let path = if active_only {
             "/instrument/active"
         } else {
@@ -242,7 +244,7 @@ impl BitmexHttpInnerClient {
     pub async fn http_get_instrument(
         &self,
         symbol: &str,
-    ) -> Result<Vec<Instrument>, BitmexHttpError> {
+    ) -> Result<Vec<BitmexInstrument>, BitmexHttpError> {
         let path = &format!("/instrument?symbol={symbol}");
         self.send_request(Method::GET, path, None, false).await
     }
@@ -252,9 +254,19 @@ impl BitmexHttpInnerClient {
     /// # Errors
     ///
     /// Returns an error if credentials are missing, the request fails, or the API returns an error.
-    pub async fn http_get_wallet(&self) -> Result<Wallet, BitmexHttpError> {
+    pub async fn http_get_wallet(&self) -> Result<BitmexWallet, BitmexHttpError> {
         let endpoint = "/user/wallet";
         self.send_request(Method::GET, endpoint, None, true).await
+    }
+
+    /// Get user margin information.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, or the API returns an error.
+    pub async fn http_get_margin(&self, currency: &str) -> Result<BitmexMargin, BitmexHttpError> {
+        let path = format!("/user/margin?currency={currency}");
+        self.send_request(Method::GET, &path, None, true).await
     }
 
     /// Get historical trades.
@@ -269,7 +281,7 @@ impl BitmexHttpInnerClient {
     pub async fn http_get_trades(
         &self,
         params: GetTradeParams,
-    ) -> Result<Vec<Trade>, BitmexHttpError> {
+    ) -> Result<Vec<BitmexTrade>, BitmexHttpError> {
         let query = serde_urlencoded::to_string(&params).expect("Invalid parameters");
         let path = format!("/trade?{query}");
         self.send_request(Method::GET, &path, None, true).await
@@ -287,7 +299,7 @@ impl BitmexHttpInnerClient {
     pub async fn http_get_orders(
         &self,
         params: GetOrderParams,
-    ) -> Result<Vec<Order>, BitmexHttpError> {
+    ) -> Result<Vec<BitmexOrder>, BitmexHttpError> {
         let query = serde_urlencoded::to_string(&params).expect("Invalid parameters");
         let path = format!("/order?{query}");
         self.send_request(Method::GET, &path, None, true).await
@@ -344,6 +356,28 @@ impl BitmexHttpInnerClient {
         self.send_request(Method::PUT, &path, None, true).await
     }
 
+    /// Cancel all orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, or the API returns an error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parameters cannot be serialized (should never happen with valid builder-generated params).
+    ///
+    /// # References
+    ///
+    /// <https://www.bitmex.com/api/explorer/#!/Order/Order_cancelAll>
+    pub async fn http_cancel_all_orders(
+        &self,
+        params: DeleteAllOrdersParams,
+    ) -> Result<Value, BitmexHttpError> {
+        let query = serde_urlencoded::to_string(&params).expect("Invalid parameters");
+        let path = format!("/order/all?{query}");
+        self.send_request(Method::DELETE, &path, None, true).await
+    }
+
     /// Get user executions.
     ///
     /// # Errors
@@ -356,7 +390,7 @@ impl BitmexHttpInnerClient {
     pub async fn http_get_executions(
         &self,
         params: GetExecutionParams,
-    ) -> Result<Vec<Execution>, BitmexHttpError> {
+    ) -> Result<Vec<BitmexExecution>, BitmexHttpError> {
         let query = serde_urlencoded::to_string(&params).expect("Invalid parameters");
         let path = format!("/execution/tradeHistory?{query}");
         self.send_request(Method::GET, &path, None, true).await
@@ -374,7 +408,7 @@ impl BitmexHttpInnerClient {
     pub async fn http_get_positions(
         &self,
         params: GetPositionParams,
-    ) -> Result<Vec<Position>, BitmexHttpError> {
+    ) -> Result<Vec<BitmexPosition>, BitmexHttpError> {
         let query = serde_urlencoded::to_string(&params).expect("Invalid parameters");
         let path = format!("/position?{query}");
         self.send_request(Method::GET, &path, None, true).await
@@ -392,7 +426,7 @@ impl BitmexHttpInnerClient {
 )]
 pub struct BitmexHttpClient {
     inner: Arc<BitmexHttpInnerClient>,
-    instruments_cache: Arc<Mutex<HashMap<Ustr, InstrumentAny>>>,
+    instruments_cache: Arc<Mutex<AHashMap<Ustr, InstrumentAny>>>,
 }
 
 impl Default for BitmexHttpClient {
@@ -403,6 +437,7 @@ impl Default for BitmexHttpClient {
 
 impl BitmexHttpClient {
     /// Creates a new [`BitmexHttpClient`] instance.
+    #[must_use]
     pub fn new(
         base_url: Option<String>,
         api_key: Option<String>,
@@ -428,7 +463,7 @@ impl BitmexHttpClient {
 
         Self {
             inner: Arc::new(inner),
-            instruments_cache: Arc::new(Mutex::new(HashMap::new())),
+            instruments_cache: Arc::new(Mutex::new(AHashMap::new())),
         }
     }
 
@@ -461,10 +496,7 @@ impl BitmexHttpClient {
         let api_secret = api_secret.or_else(|| get_env_var("BITMEX_API_SECRET").ok());
 
         // Determine testnet from URL if provided
-        let testnet = base_url
-            .as_ref()
-            .map(|url| url.contains("testnet"))
-            .unwrap_or(false);
+        let testnet = base_url.as_ref().is_some_and(|url| url.contains("testnet"));
 
         // If we're trying to create an authenticated client, we need both key and secret
         if api_key.is_some() && api_secret.is_none() {
@@ -484,11 +516,13 @@ impl BitmexHttpClient {
     }
 
     /// Returns the base url being used by the client.
+    #[must_use]
     pub fn base_url(&self) -> &str {
         self.inner.base_url.as_str()
     }
 
     /// Returns the public API key being used by the client.
+    #[must_use]
     pub fn api_key(&self) -> Option<&str> {
         self.inner.credential.as_ref().map(|c| c.api_key.as_str())
     }
@@ -505,7 +539,7 @@ impl BitmexHttpClient {
     pub async fn get_instruments(
         &self,
         active_only: bool,
-    ) -> Result<Vec<Instrument>, BitmexHttpError> {
+    ) -> Result<Vec<BitmexInstrument>, BitmexHttpError> {
         let inner = self.inner.clone();
         inner.http_get_instruments(active_only).await
     }
@@ -522,7 +556,7 @@ impl BitmexHttpClient {
     pub async fn get_instrument(
         &self,
         symbol: &Symbol,
-    ) -> Result<Vec<Instrument>, BitmexHttpError> {
+    ) -> Result<Vec<BitmexInstrument>, BitmexHttpError> {
         let inner = self.inner.clone();
         inner.http_get_instrument(symbol.as_ref()).await
     }
@@ -536,7 +570,7 @@ impl BitmexHttpClient {
     /// # Panics
     ///
     /// Panics if the inner mutex is poisoned.
-    pub async fn get_wallet(&self) -> Result<Wallet, BitmexHttpError> {
+    pub async fn get_wallet(&self) -> Result<BitmexWallet, BitmexHttpError> {
         let inner = self.inner.clone();
         inner.http_get_wallet().await
     }
@@ -550,7 +584,10 @@ impl BitmexHttpClient {
     /// # Panics
     ///
     /// Panics if the inner mutex is poisoned.
-    pub async fn get_trades(&self, params: GetTradeParams) -> Result<Vec<Trade>, BitmexHttpError> {
+    pub async fn get_trades(
+        &self,
+        params: GetTradeParams,
+    ) -> Result<Vec<BitmexTrade>, BitmexHttpError> {
         let inner = self.inner.clone();
         inner.http_get_trades(params).await
     }
@@ -564,12 +601,15 @@ impl BitmexHttpClient {
     /// # Panics
     ///
     /// Panics if the inner mutex is poisoned.
-    pub async fn get_orders(&self, params: GetOrderParams) -> Result<Vec<Order>, BitmexHttpError> {
+    pub async fn get_orders(
+        &self,
+        params: GetOrderParams,
+    ) -> Result<Vec<BitmexOrder>, BitmexHttpError> {
         let inner = self.inner.clone();
         inner.http_get_orders(params).await
     }
 
-    /// Place a new order.
+    /// Place a new order with raw API params.
     ///
     /// # Errors
     ///
@@ -578,12 +618,15 @@ impl BitmexHttpClient {
     /// # Panics
     ///
     /// Panics if the inner mutex is poisoned.
-    pub async fn place_order(&self, params: PostOrderParams) -> Result<Value, BitmexHttpError> {
+    pub async fn http_place_order(
+        &self,
+        params: PostOrderParams,
+    ) -> Result<Value, BitmexHttpError> {
         let inner = self.inner.clone();
         inner.http_place_order(params).await
     }
 
-    /// Cancel user orders.
+    /// Cancel user orders with raw API params.
     ///
     /// # Errors
     ///
@@ -592,12 +635,15 @@ impl BitmexHttpClient {
     /// # Panics
     ///
     /// Panics if the inner mutex is poisoned.
-    pub async fn cancel_orders(&self, params: DeleteOrderParams) -> Result<Value, BitmexHttpError> {
+    pub async fn http_cancel_orders(
+        &self,
+        params: DeleteOrderParams,
+    ) -> Result<Value, BitmexHttpError> {
         let inner = self.inner.clone();
         inner.http_cancel_orders(params).await
     }
 
-    /// Amend an existing order.
+    /// Amend an existing order with raw API params.
     ///
     /// # Errors
     ///
@@ -606,9 +652,30 @@ impl BitmexHttpClient {
     /// # Panics
     ///
     /// Panics if the inner mutex is poisoned.
-    pub async fn amend_order(&self, params: PutOrderParams) -> Result<Value, BitmexHttpError> {
+    pub async fn http_amend_order(&self, params: PutOrderParams) -> Result<Value, BitmexHttpError> {
         let inner = self.inner.clone();
         inner.http_amend_order(params).await
+    }
+
+    /// Cancel all orders with raw API params.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, or the API returns an error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner mutex is poisoned.
+    ///
+    /// # References
+    ///
+    /// <https://www.bitmex.com/api/explorer/#!/Order/Order_cancelAll>
+    pub async fn http_cancel_all_orders(
+        &self,
+        params: DeleteAllOrdersParams,
+    ) -> Result<Value, BitmexHttpError> {
+        let inner = self.inner.clone();
+        inner.http_cancel_all_orders(params).await
     }
 
     /// Get user executions.
@@ -623,7 +690,7 @@ impl BitmexHttpClient {
     pub async fn get_executions(
         &self,
         params: GetExecutionParams,
-    ) -> Result<Vec<Execution>, BitmexHttpError> {
+    ) -> Result<Vec<BitmexExecution>, BitmexHttpError> {
         let inner = self.inner.clone();
         inner.http_get_executions(params).await
     }
@@ -640,7 +707,7 @@ impl BitmexHttpClient {
     pub async fn get_positions(
         &self,
         params: GetPositionParams,
-    ) -> Result<Vec<Position>, BitmexHttpError> {
+    ) -> Result<Vec<BitmexPosition>, BitmexHttpError> {
         let inner = self.inner.clone();
         inner.http_get_positions(params).await
     }
@@ -655,5 +722,405 @@ impl BitmexHttpClient {
             .lock()
             .unwrap()
             .insert(instrument.raw_symbol().inner(), instrument);
+    }
+
+    /// Get price precision for a symbol from the instruments cache.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the instruments cache mutex is poisoned.
+    pub fn get_price_precision(&self, symbol: &str) -> Option<u8> {
+        let cache = self.instruments_cache.lock().unwrap();
+        let symbol_ustr = Ustr::from(symbol);
+        cache.get(&symbol_ustr).map(|inst| inst.price_precision())
+    }
+
+    /// Get user margin information.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, or the API returns an error.
+    pub async fn http_get_margin(&self, currency: &str) -> anyhow::Result<BitmexMargin> {
+        self.inner
+            .http_get_margin(currency)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Request account state for the given account.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or no account state is returned.
+    pub async fn request_account_state(
+        &self,
+        account_id: AccountId,
+    ) -> anyhow::Result<AccountState> {
+        // Get margin data for XBt (Bitcoin) by default
+        let margin = self
+            .inner
+            .http_get_margin("XBt")
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let ts_init = nautilus_core::nanos::UnixNanos::from(
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64,
+        );
+
+        // Convert HTTP Margin to WebSocket MarginMsg for parsing
+        let margin_msg = BitmexMarginMsg {
+            account: margin.account,
+            currency: margin.currency,
+            risk_limit: margin.risk_limit,
+            amount: margin.amount,
+            prev_realised_pnl: margin.prev_realised_pnl,
+            gross_comm: margin.gross_comm,
+            gross_open_cost: margin.gross_open_cost,
+            gross_open_premium: margin.gross_open_premium,
+            gross_exec_cost: margin.gross_exec_cost,
+            gross_mark_value: margin.gross_mark_value,
+            risk_value: margin.risk_value,
+            init_margin: margin.init_margin,
+            maint_margin: margin.maint_margin,
+            target_excess_margin: margin.target_excess_margin,
+            realised_pnl: margin.realised_pnl,
+            unrealised_pnl: margin.unrealised_pnl,
+            wallet_balance: margin.wallet_balance,
+            margin_balance: margin.margin_balance,
+            margin_leverage: margin.margin_leverage,
+            margin_used_pcnt: margin.margin_used_pcnt,
+            excess_margin: margin.excess_margin,
+            available_margin: margin.available_margin,
+            withdrawable_margin: margin.withdrawable_margin,
+            maker_fee_discount: None, // Not in HTTP response
+            taker_fee_discount: None, // Not in HTTP response
+            timestamp: margin.timestamp.unwrap_or_else(chrono::Utc::now),
+            foreign_margin_balance: None,
+            foreign_requirement: None,
+        };
+
+        crate::common::parse::parse_account_state(&margin_msg, account_id, ts_init)
+    }
+
+    // ========================================================================
+    // Domain-level methods (take domain types, return domain types)
+    // ========================================================================
+
+    /// Submit a new order using domain types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, order validation fails, or the API returns an error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn submit_order(
+        &self,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: TimeInForce,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+        reduce_only: bool,
+        display_qty: Option<Quantity>,
+    ) -> anyhow::Result<OrderStatusReport> {
+        use crate::common::enums::{
+            BitmexExecInstruction, BitmexOrderType, BitmexSide, BitmexTimeInForce,
+        };
+
+        // Build PostOrderParams
+        let mut params = super::query::PostOrderParamsBuilder::default();
+        params.symbol(instrument_id.symbol.as_str());
+        params.cl_ord_id(client_order_id.as_str());
+
+        // Convert and set order side
+        let side: BitmexSide = order_side.into();
+        params.side(side);
+
+        // Convert and set order type
+        let ord_type: BitmexOrderType = order_type.into();
+        params.ord_type(ord_type);
+
+        // Set quantity
+        params.order_qty(quantity.as_f64() as u32);
+
+        // Convert and set time in force
+        let tif: BitmexTimeInForce = time_in_force.into();
+        params.time_in_force(tif);
+
+        // Set price for limit orders
+        if let Some(price) = price {
+            params.price(price.as_f64());
+        }
+
+        // Set trigger price for stop orders
+        if let Some(trigger_price) = trigger_price {
+            params.stop_px(trigger_price.as_f64());
+        }
+
+        // Set display quantity
+        if let Some(display_qty) = display_qty {
+            params.display_qty(display_qty.as_f64() as u32);
+        }
+
+        // Set execution instructions
+        let mut exec_inst = Vec::new();
+        if reduce_only {
+            exec_inst.push(BitmexExecInstruction::ReduceOnly);
+        }
+        if !exec_inst.is_empty() {
+            params.exec_inst(exec_inst);
+        }
+
+        let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Submit the order
+        let response = self.inner.http_place_order(params).await?;
+
+        // Parse the response to OrderStatusReport
+        let order: BitmexOrder = serde_json::from_value(response)?;
+        let price_precision = self
+            .get_price_precision(instrument_id.symbol.as_str())
+            .unwrap_or(2);
+
+        crate::http::parse::parse_order_status_report(order, price_precision)
+    }
+
+    /// Cancel an order using domain types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, the order doesn't exist, or the API returns an error.
+    pub async fn cancel_order(
+        &self,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+    ) -> anyhow::Result<OrderStatusReport> {
+        // Build DeleteOrderParams
+        let mut params = super::query::DeleteOrderParamsBuilder::default();
+
+        // Set order ID - prefer venue_order_id if available
+        if let Some(venue_order_id) = venue_order_id {
+            params.order_id(vec![venue_order_id.as_str().to_string()]);
+        } else if let Some(client_order_id) = client_order_id {
+            params.cl_ord_id(vec![client_order_id.as_str().to_string()]);
+        } else {
+            return Err(anyhow::anyhow!(
+                "Either client_order_id or venue_order_id must be provided"
+            ));
+        }
+
+        let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Cancel the order
+        let response = self.inner.http_cancel_orders(params).await?;
+
+        // Parse the response - BitMEX returns an array
+        let orders: Vec<BitmexOrder> = serde_json::from_value(response)?;
+        let order = orders
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No order returned in cancel response"))?;
+
+        let price_precision = self
+            .get_price_precision(instrument_id.symbol.as_str())
+            .unwrap_or(2);
+
+        crate::http::parse::parse_order_status_report(order, price_precision)
+    }
+
+    /// Cancel all orders for an instrument using domain types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, or the API returns an error.
+    pub async fn cancel_all_orders(
+        &self,
+        instrument_id: InstrumentId,
+        order_side: Option<OrderSide>,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        use crate::common::enums::BitmexSide;
+
+        // Build DeleteAllOrdersParams
+        let mut params = super::query::DeleteAllOrdersParamsBuilder::default();
+        params.symbol(instrument_id.symbol.as_str());
+
+        // Set side filter if specified
+        if let Some(side) = order_side {
+            let side: BitmexSide = side.into();
+            params.filter(serde_json::json!({
+                "side": side
+            }));
+        }
+
+        let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Cancel all orders
+        let response = self.inner.http_cancel_all_orders(params).await?;
+
+        // Parse the response
+        let orders: Vec<BitmexOrder> = serde_json::from_value(response)?;
+        let price_precision = self
+            .get_price_precision(instrument_id.symbol.as_str())
+            .unwrap_or(2);
+
+        let mut reports = Vec::new();
+        for order in orders {
+            reports.push(crate::http::parse::parse_order_status_report(
+                order,
+                price_precision,
+            )?);
+        }
+
+        Ok(reports)
+    }
+
+    /// Modify an existing order using domain types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, the order doesn't exist, or the API returns an error.
+    pub async fn modify_order(
+        &self,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+        quantity: Option<Quantity>,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+    ) -> anyhow::Result<OrderStatusReport> {
+        // Build PutOrderParams
+        let mut params = super::query::PutOrderParamsBuilder::default();
+
+        // Set order ID - prefer venue_order_id if available
+        if let Some(venue_order_id) = venue_order_id {
+            params.order_id(venue_order_id.as_str());
+        } else if let Some(client_order_id) = client_order_id {
+            params.orig_cl_ord_id(client_order_id.as_str());
+        } else {
+            return Err(anyhow::anyhow!(
+                "Either client_order_id or venue_order_id must be provided"
+            ));
+        }
+
+        // Set new values if provided
+        if let Some(quantity) = quantity {
+            params.order_qty(quantity.as_f64() as u32);
+        }
+
+        if let Some(price) = price {
+            params.price(price.as_f64());
+        }
+
+        if let Some(trigger_price) = trigger_price {
+            params.stop_px(trigger_price.as_f64());
+        }
+
+        let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Amend the order
+        let response = self.inner.http_amend_order(params).await?;
+
+        // Parse the response
+        let order: BitmexOrder = serde_json::from_value(response)?;
+        let price_precision = self
+            .get_price_precision(instrument_id.symbol.as_str())
+            .unwrap_or(2);
+
+        crate::http::parse::parse_order_status_report(order, price_precision)
+    }
+
+    /// Request a single order status report using domain types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, or the API returns an error.
+    pub async fn request_order_status_report(
+        &self,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+    ) -> anyhow::Result<OrderStatusReport> {
+        // Build GetOrderParams
+        let mut params = super::query::GetOrderParamsBuilder::default();
+        params.symbol(instrument_id.symbol.as_str());
+
+        // Filter by order ID
+        if let Some(venue_order_id) = venue_order_id {
+            params.filter(serde_json::json!({
+                "orderID": venue_order_id.as_str()
+            }));
+        } else if let Some(client_order_id) = client_order_id {
+            params.filter(serde_json::json!({
+                "clOrdID": client_order_id.as_str()
+            }));
+        }
+
+        params.count(1i32);
+        let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Get the order
+        let orders = self.inner.http_get_orders(params).await?;
+        let order = orders
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Order not found"))?;
+
+        let price_precision = self
+            .get_price_precision(instrument_id.symbol.as_str())
+            .unwrap_or(2);
+
+        crate::http::parse::parse_order_status_report(order, price_precision)
+    }
+
+    /// Request multiple order status reports using domain types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if credentials are missing, the request fails, or the API returns an error.
+    pub async fn request_order_status_reports(
+        &self,
+        instrument_id: Option<InstrumentId>,
+        open_only: bool,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        // Build GetOrderParams
+        let mut params = super::query::GetOrderParamsBuilder::default();
+
+        // Filter by symbol if provided
+        if let Some(instrument_id) = &instrument_id {
+            params.symbol(instrument_id.symbol.as_str());
+        }
+
+        // Filter by open status if requested
+        if open_only {
+            params.filter(serde_json::json!({
+                "open": true
+            }));
+        }
+
+        // Set limit
+        if let Some(limit) = limit {
+            params.count(limit as i32);
+        }
+
+        let params = params.build().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Get the orders
+        let orders = self.inner.http_get_orders(params).await?;
+
+        let mut reports = Vec::new();
+        for order in orders {
+            let symbol = order.symbol.as_ref().map(|s| s.as_str()).unwrap_or("");
+            let price_precision = self.get_price_precision(symbol).unwrap_or(2);
+            reports.push(crate::http::parse::parse_order_status_report(
+                order,
+                price_precision,
+            )?);
+        }
+
+        Ok(reports)
     }
 }

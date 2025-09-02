@@ -13,13 +13,41 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Python bindings for the OKX WebSocket client.
+//!
+//! # Design Pattern: Clone and Share State
+//!
+//! The WebSocket client must be cloned for async operations because PyO3's `future_into_py`
+//! requires `'static` futures (cannot borrow from `self`). To ensure clones share the same
+//! connection state, key fields use `Arc<RwLock<T>>`:
+//!
+//! - `inner: Arc<RwLock<Option<WebSocketClient>>>` - The WebSocket connection.
+//!
+//! Without shared state, clones would be independent, causing:
+//! - Lost WebSocket messages.
+//! - Missing instrument data.
+//! - Connection state desynchronization.
+//!
+//! ## Connection Flow
+//!
+//! 1. Clone the client for async operation.
+//! 2. Connect and populate shared state on the clone.
+//! 3. Spawn stream handler as background task.
+//! 4. Return immediately (non-blocking).
+//!
+//! ## Important Notes
+//!
+//! - Never use `block_on()` - it blocks the runtime.
+//! - Always clone before async blocks for lifetime requirements.
+//! - RwLock is preferred over Mutex (many reads, few writes).
+
 use std::str::FromStr;
 
 use futures_util::StreamExt;
-use nautilus_core::python::to_pyvalue_err;
+use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_model::{
     data::{BarType, Data, OrderBookDeltas_API},
-    enums::{OrderSide, OrderType, PositionSide},
+    enums::{OrderSide, OrderType, PositionSide, TimeInForce},
     identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     python::{
         data::data_to_pycapsule,
@@ -28,7 +56,6 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use pyo3::{IntoPyObjectExt, exceptions::PyRuntimeError, prelude::*};
-use pyo3_async_runtimes::tokio::get_runtime;
 
 use crate::{
     common::enums::{OKXInstrumentType, OKXTradeMode},
@@ -143,6 +170,22 @@ impl OKXWebSocketClient {
         self.is_closed()
     }
 
+    #[pyo3(name = "get_subscriptions")]
+    fn py_get_subscriptions(&self, instrument_id: InstrumentId) -> Vec<String> {
+        let channels = self.get_subscriptions(instrument_id);
+
+        // Convert to OKX channel names
+        channels
+            .iter()
+            .map(|c| {
+                serde_json::to_value(c)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| c.to_string())
+            })
+            .collect()
+    }
+
     #[pyo3(name = "connect")]
     fn py_connect<'py>(
         &mut self,
@@ -156,71 +199,97 @@ impl OKXWebSocketClient {
             instruments_any.push(inst_any);
         }
 
-        get_runtime().block_on(async {
-            self.connect(instruments_any)
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })?;
+        self.initialize_instruments_cache(instruments_any);
 
-        let stream = self.stream();
+        let mut client = self.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            tokio::pin!(stream);
+            client.connect().await.map_err(to_pyruntime_err)?;
 
-            while let Some(msg) = stream.next().await {
-                match msg {
-                    NautilusWsMessage::Instrument(msg) => {
-                        call_python_with_data(&callback, |py| instrument_any_to_pyobject(py, *msg));
-                    }
-                    NautilusWsMessage::Data(msg) => Python::with_gil(|py| {
-                        for data in msg {
-                            let py_obj = data_to_pycapsule(py, data);
+            let stream = client.stream();
+
+            tokio::spawn(async move {
+                tokio::pin!(stream);
+
+                while let Some(msg) = stream.next().await {
+                    match msg {
+                        NautilusWsMessage::Instrument(msg) => {
+                            call_python_with_data(&callback, |py| {
+                                instrument_any_to_pyobject(py, *msg)
+                            });
+                        }
+                        NautilusWsMessage::Data(msg) => Python::with_gil(|py| {
+                            for data in msg {
+                                let py_obj = data_to_pycapsule(py, data);
+                                call_python(py, &callback, py_obj);
+                            }
+                        }),
+                        NautilusWsMessage::FundingRates(msg) => {
+                            for data in msg {
+                                call_python_with_data(&callback, |py| data.into_py_any(py));
+                            }
+                        }
+                        NautilusWsMessage::OrderRejected(msg) => {
+                            call_python_with_data(&callback, |py| msg.into_py_any(py))
+                        }
+                        NautilusWsMessage::OrderCancelRejected(msg) => {
+                            call_python_with_data(&callback, |py| msg.into_py_any(py))
+                        }
+                        NautilusWsMessage::OrderModifyRejected(msg) => {
+                            call_python_with_data(&callback, |py| msg.into_py_any(py))
+                        }
+                        NautilusWsMessage::ExecutionReports(msg) => {
+                            for report in msg {
+                                match report {
+                                    ExecutionReport::Order(report) => {
+                                        call_python_with_data(&callback, |py| {
+                                            report.into_py_any(py)
+                                        })
+                                    }
+                                    ExecutionReport::Fill(report) => {
+                                        call_python_with_data(&callback, |py| {
+                                            report.into_py_any(py)
+                                        })
+                                    }
+                                };
+                            }
+                        }
+                        NautilusWsMessage::Deltas(msg) => Python::with_gil(|py| {
+                            let py_obj =
+                                data_to_pycapsule(py, Data::Deltas(OrderBookDeltas_API::new(msg)));
                             call_python(py, &callback, py_obj);
+                        }),
+                        NautilusWsMessage::AccountUpdate(msg) => {
+                            call_python_with_data(&callback, |py| msg.py_to_dict(py));
                         }
-                    }),
-                    NautilusWsMessage::FundingRates(msg) => {
-                        for data in msg {
-                            call_python_with_data(&callback, |py| data.into_py_any(py));
+                        NautilusWsMessage::Reconnected => {} // Nothing to handle
+                        NautilusWsMessage::Error(msg) => {
+                            call_python_with_data(&callback, |py| msg.into_py_any(py));
                         }
-                    }
-                    NautilusWsMessage::OrderRejected(msg) => {
-                        call_python_with_data(&callback, |py| msg.into_py_any(py))
-                    }
-                    NautilusWsMessage::OrderCancelRejected(msg) => {
-                        call_python_with_data(&callback, |py| msg.into_py_any(py))
-                    }
-                    NautilusWsMessage::OrderModifyRejected(msg) => {
-                        call_python_with_data(&callback, |py| msg.into_py_any(py))
-                    }
-                    NautilusWsMessage::ExecutionReports(msg) => {
-                        for report in msg {
-                            match report {
-                                ExecutionReport::Order(report) => {
-                                    call_python_with_data(&callback, |py| report.into_py_any(py))
-                                }
-                                ExecutionReport::Fill(report) => {
-                                    call_python_with_data(&callback, |py| report.into_py_any(py))
-                                }
-                            };
+                        NautilusWsMessage::Raw(msg) => {
+                            tracing::debug!("Received raw message, skipping: {msg}");
                         }
-                    }
-                    NautilusWsMessage::Deltas(msg) => Python::with_gil(|py| {
-                        let py_obj =
-                            data_to_pycapsule(py, Data::Deltas(OrderBookDeltas_API::new(msg)));
-                        call_python(py, &callback, py_obj);
-                    }),
-                    NautilusWsMessage::AccountUpdate(msg) => {
-                        call_python_with_data(&callback, |py| msg.py_to_dict(py));
-                    }
-                    NautilusWsMessage::Error(msg) => {
-                        call_python_with_data(&callback, |py| msg.into_py_any(py));
-                    }
-                    NautilusWsMessage::Raw(msg) => {
-                        tracing::debug!("Received raw message, skipping: {msg}");
                     }
                 }
-            }
+            });
 
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "wait_until_active")]
+    fn py_wait_until_active<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .wait_until_active(timeout_secs)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Ok(())
         })
     }
@@ -722,6 +791,7 @@ impl OKXWebSocketClient {
         order_side,
         order_type,
         quantity,
+        time_in_force=None,
         price=None,
         trigger_price=None,
         post_only=None,
@@ -741,6 +811,7 @@ impl OKXWebSocketClient {
         order_side: OrderSide,
         order_type: OrderType,
         quantity: Quantity,
+        time_in_force: Option<TimeInForce>,
         price: Option<Price>,
         trigger_price: Option<Price>,
         post_only: Option<bool>,
@@ -761,6 +832,7 @@ impl OKXWebSocketClient {
                     order_side,
                     order_type,
                     quantity,
+                    time_in_force,
                     price,
                     trigger_price,
                     post_only,
@@ -769,8 +841,7 @@ impl OKXWebSocketClient {
                     position_side,
                 )
                 .await
-                .map_err(to_pyvalue_err)?;
-            Ok(())
+                .map_err(to_pyvalue_err)
         })
     }
 
@@ -780,9 +851,8 @@ impl OKXWebSocketClient {
         trader_id,
         strategy_id,
         instrument_id,
-        client_order_id,
+        client_order_id=None,
         venue_order_id=None,
-        position_side=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_cancel_order<'py>(
@@ -791,9 +861,8 @@ impl OKXWebSocketClient {
         trader_id: TraderId,
         strategy_id: StrategyId,
         instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
+        client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
-        position_side: Option<PositionSide>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -805,11 +874,9 @@ impl OKXWebSocketClient {
                     instrument_id,
                     client_order_id,
                     venue_order_id,
-                    position_side,
                 )
                 .await
-                .map_err(to_pyvalue_err)?;
-            Ok(())
+                .map_err(to_pyvalue_err)
         })
     }
 
@@ -819,12 +886,10 @@ impl OKXWebSocketClient {
         trader_id,
         strategy_id,
         instrument_id,
-        client_order_id,
-        new_client_order_id,
+        client_order_id=None,
+        venue_order_id=None,
         price=None,
         quantity=None,
-        venue_order_id=None,
-        position_side=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_modify_order<'py>(
@@ -833,12 +898,10 @@ impl OKXWebSocketClient {
         trader_id: TraderId,
         strategy_id: StrategyId,
         instrument_id: InstrumentId,
-        client_order_id: ClientOrderId,
-        new_client_order_id: ClientOrderId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
         price: Option<Price>,
         quantity: Option<Quantity>,
-        venue_order_id: Option<VenueOrderId>,
-        position_side: Option<PositionSide>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -849,15 +912,12 @@ impl OKXWebSocketClient {
                     strategy_id,
                     instrument_id,
                     client_order_id,
-                    new_client_order_id,
                     price,
                     quantity,
                     venue_order_id,
-                    position_side,
                 )
                 .await
-                .map_err(to_pyvalue_err)?;
-            Ok(())
+                .map_err(to_pyvalue_err)
         })
     }
 
@@ -928,8 +988,7 @@ impl OKXWebSocketClient {
             client
                 .batch_submit_orders(domain_orders)
                 .await
-                .map_err(to_pyvalue_err)?;
-            Ok(())
+                .map_err(to_pyvalue_err)
         })
     }
 
@@ -943,24 +1002,17 @@ impl OKXWebSocketClient {
         let mut domain_orders = Vec::with_capacity(orders.len());
 
         for obj in orders {
-            let (instrument_type, instrument_id, client_order_id, order_id, position_side): (
+            let (instrument_type, instrument_id, client_order_id, order_id): (
                 String,
                 InstrumentId,
                 Option<ClientOrderId>,
                 Option<String>,
-                Option<PositionSide>,
             ) = obj
                 .extract(py)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let inst_type =
                 OKXInstrumentType::from_str(&instrument_type).map_err(to_pyvalue_err)?;
-            domain_orders.push((
-                inst_type,
-                instrument_id,
-                client_order_id,
-                order_id,
-                position_side,
-            ));
+            domain_orders.push((inst_type, instrument_id, client_order_id, order_id));
         }
 
         let client = self.clone();
@@ -969,8 +1021,7 @@ impl OKXWebSocketClient {
             client
                 .batch_cancel_orders(domain_orders)
                 .await
-                .map_err(to_pyvalue_err)?;
-            Ok(())
+                .map_err(to_pyvalue_err)
         })
     }
 
@@ -991,7 +1042,6 @@ impl OKXWebSocketClient {
                 new_client_order_id,
                 price,
                 quantity,
-                position_side,
             ): (
                 String,
                 InstrumentId,
@@ -999,7 +1049,6 @@ impl OKXWebSocketClient {
                 ClientOrderId,
                 Option<Price>,
                 Option<Quantity>,
-                Option<PositionSide>,
             ) = obj
                 .extract(py)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1012,7 +1061,6 @@ impl OKXWebSocketClient {
                 new_client_order_id,
                 price,
                 quantity,
-                position_side,
             ));
         }
 
@@ -1022,8 +1070,7 @@ impl OKXWebSocketClient {
             client
                 .batch_modify_orders(domain_orders)
                 .await
-                .map_err(to_pyvalue_err)?;
-            Ok(())
+                .map_err(to_pyvalue_err)
         })
     }
 }

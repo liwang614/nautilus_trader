@@ -94,7 +94,7 @@ jobs:
 
       - name: Install Nautilus CLI and run init postgres
         run: |
-          make install-cli
+          curl -fsSL https://packages.nautechsystems.io/cli/nautilus-cli/install.sh | bash -s -- -b "$HOME/.local/bin"
           nautilus database init --schema ${{ github.workspace }}/schema/sql
         env:
           POSTGRES_HOST: localhost
@@ -107,7 +107,7 @@ jobs:
         uses: ./.github/actions/common-test-data
 
       - name: Run Rust tests
-        run: make cargo-test
+        run: make cargo-test-hypersync
 
       # Update version for dev/nightly branches
       - name: Update version in pyproject.toml

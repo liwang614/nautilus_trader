@@ -65,9 +65,9 @@ pub struct Pool {
     /// • `500`   →  0.05 %  (5 bps)
     /// • `3_000` →  0.30 %  (30 bps)
     /// • `10_000`→  1.00 %
-    pub fee: u32,
+    pub fee: Option<u32>,
     /// The minimum tick spacing for positions in concentrated liquidity AMMs.
-    pub tick_spacing: u32,
+    pub tick_spacing: Option<u32>,
     /// UNIX timestamp (nanoseconds) when the instance was created.
     pub ts_init: UnixNanos,
 }
@@ -86,8 +86,8 @@ impl Pool {
         creation_block: u64,
         token0: Token,
         token1: Token,
-        fee: u32,
-        tick_spacing: u32,
+        fee: Option<u32>,
+        tick_spacing: Option<u32>,
         ts_init: UnixNanos,
     ) -> Self {
         let instrument_id = Self::create_instrument_id(chain.name, &dex, &address);
@@ -106,6 +106,17 @@ impl Pool {
         }
     }
 
+    /// Returns a formatted string representation of the pool for display purposes.
+    pub fn to_full_spec_string(&self) -> String {
+        format!(
+            "{}/{}-{}.{}",
+            self.token0.symbol,
+            self.token1.symbol,
+            self.fee.unwrap_or(0),
+            self.instrument_id.venue
+        )
+    }
+
     pub fn create_instrument_id(chain: Blockchain, dex: &Dex, address: &Address) -> InstrumentId {
         let symbol = Symbol::new(address.to_string());
         let venue = Venue::new(format!("{}:{}", chain, dex.name));
@@ -118,7 +129,11 @@ impl Display for Pool {
         write!(
             f,
             "Pool(instrument_id={}, dex={}, fee={}, address={})",
-            self.instrument_id, self.dex.name, self.fee, self.address
+            self.instrument_id,
+            self.dex.name,
+            self.fee
+                .map_or("None".to_string(), |fee| format!("fee={}, ", fee)),
+            self.address
         )
     }
 }
@@ -155,6 +170,7 @@ mod tests {
             "Swap(address,address,int256,int256,uint160,uint128,int24)",
             "Mint(address,address,int24,int24,uint128,uint256,uint256)",
             "Burn(address,int24,int24,uint128,uint256,uint256)",
+            "Collect(address,address,int24,int24,uint128,uint128)",
         );
 
         let token0 = Token::new(
@@ -189,8 +205,8 @@ mod tests {
             12345678,
             token0,
             token1,
-            3000,
-            60,
+            Some(3000),
+            Some(60),
             ts_init,
         );
 
@@ -200,8 +216,8 @@ mod tests {
         assert_eq!(pool.creation_block, 12345678);
         assert_eq!(pool.token0.symbol, "WETH");
         assert_eq!(pool.token1.symbol, "USDT");
-        assert_eq!(pool.fee, 3000);
-        assert_eq!(pool.tick_spacing, 60);
+        assert_eq!(pool.fee.unwrap(), 3000);
+        assert_eq!(pool.tick_spacing.unwrap(), 60);
         assert_eq!(pool.ts_init, ts_init);
         assert_eq!(
             pool.instrument_id.symbol.as_str(),
@@ -225,6 +241,7 @@ mod tests {
             "Swap(address,address,int256,int256,uint160,uint128,int24)",
             "Mint(address,address,int24,int24,uint128,uint256,uint256)",
             "Burn(address,int24,int24,uint128,uint256,uint256)",
+            "Collect(address,address,int24,int24,uint128,uint128)",
         );
 
         let token0 = Token::new(
@@ -256,8 +273,8 @@ mod tests {
             0,
             token0,
             token1,
-            3000,
-            60,
+            Some(3000),
+            Some(60),
             UnixNanos::default(),
         );
 

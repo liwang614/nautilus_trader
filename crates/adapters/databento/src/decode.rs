@@ -39,8 +39,6 @@ use super::{
     types::{DatabentoImbalance, DatabentoStatistics},
 };
 
-const DATABENTO_FIXED_SCALAR: f64 = 1_000_000_000.0;
-
 // SAFETY: Known valid value
 const STEP_ONE: NonZeroUsize = NonZeroUsize::new(1).unwrap();
 
@@ -287,11 +285,38 @@ pub fn decode_optional_quantity(value: i64) -> Option<Quantity> {
 }
 
 /// Decodes a multiplier from the given value, expressed in units of 1e-9.
-#[must_use]
-pub fn decode_multiplier(value: i64) -> Quantity {
+/// Uses exact integer arithmetic to avoid precision loss in financial calculations.
+///
+/// # Errors
+///
+/// Returns an error if value is negative (invalid multiplier).
+pub fn decode_multiplier(value: i64) -> anyhow::Result<Quantity> {
     match value {
-        0 | i64::MAX => Quantity::from(1),
-        _ => Quantity::from(format!("{}", value as f64 / DATABENTO_FIXED_SCALAR)),
+        0 | i64::MAX => Ok(Quantity::from(1)),
+        v if v < 0 => anyhow::bail!("Invalid negative multiplier: {v}"),
+        v => {
+            // Work in integers: v is fixed-point with 9 fractional digits.
+            // Build a canonical decimal string without floating-point.
+            let abs = v as u128;
+
+            const SCALE: u128 = 1_000_000_000;
+            let int_part = abs / SCALE;
+            let frac_part = abs % SCALE;
+
+            // Format fractional part with exactly 9 digits, then trim trailing zeros
+            // to keep a canonical representation.
+            if frac_part == 0 {
+                // Pure integer
+                Ok(Quantity::from(int_part as u64))
+            } else {
+                let mut frac_str = format!("{frac_part:09}");
+                while frac_str.ends_with('0') {
+                    frac_str.pop();
+                }
+                let s = format!("{int_part}.{frac_str}");
+                Ok(Quantity::from(s))
+            }
+        }
     }
 }
 
@@ -1048,7 +1073,7 @@ pub fn decode_futures_contract(
     let underlying = Ustr::from(msg.asset()?);
     let (asset_class, _) = parse_cfi_iso10926(msg.cfi()?)?;
     let price_increment = decode_price_increment(msg.min_price_increment, currency.precision);
-    let multiplier = decode_multiplier(msg.unit_of_measure_qty);
+    let multiplier = decode_multiplier(msg.unit_of_measure_qty)?;
     let lot_size = decode_lot_size(msg.min_lot_size_round_lot);
     let ts_event = UnixNanos::from(msg.ts_recv); // More accurate and reliable timestamp
     let ts_init = ts_init.unwrap_or(ts_event);
@@ -1095,7 +1120,7 @@ pub fn decode_futures_spread(
     let strategy_type = Ustr::from(msg.secsubtype()?);
     let currency = parse_currency_or_usd_default(msg.currency());
     let price_increment = decode_price_increment(msg.min_price_increment, currency.precision);
-    let multiplier = decode_multiplier(msg.unit_of_measure_qty);
+    let multiplier = decode_multiplier(msg.unit_of_measure_qty)?;
     let lot_size = decode_lot_size(msg.min_lot_size_round_lot);
     let ts_event = UnixNanos::from(msg.ts_recv); // More accurate and reliable timestamp
     let ts_init = ts_init.unwrap_or(ts_event);
@@ -1153,7 +1178,7 @@ pub fn decode_option_contract(
         strike_price_currency.precision,
     );
     let price_increment = decode_price_increment(msg.min_price_increment, currency.precision);
-    let multiplier = decode_multiplier(msg.unit_of_measure_qty);
+    let multiplier = decode_multiplier(msg.unit_of_measure_qty)?;
     let lot_size = decode_lot_size(msg.min_lot_size_round_lot);
     let ts_event = UnixNanos::from(msg.ts_recv); // More accurate and reliable timestamp
     let ts_init = ts_init.unwrap_or(ts_event);
@@ -1207,7 +1232,7 @@ pub fn decode_option_spread(
     let strategy_type = Ustr::from(msg.secsubtype()?);
     let currency = parse_currency_or_usd_default(msg.currency());
     let price_increment = decode_price_increment(msg.min_price_increment, currency.precision);
-    let multiplier = decode_multiplier(msg.unit_of_measure_qty);
+    let multiplier = decode_multiplier(msg.unit_of_measure_qty)?;
     let lot_size = decode_lot_size(msg.min_lot_size_round_lot);
     let ts_event = msg.ts_recv.into(); // More accurate and reliable timestamp
     let ts_init = ts_init.unwrap_or(ts_event);
@@ -1437,6 +1462,35 @@ mod tests {
     fn test_decode_optional_quantity(#[case] value: i64, #[case] expected: Option<Quantity>) {
         let actual = decode_optional_quantity(value);
         assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case(0, Quantity::from(1))] // Default fallback for 0
+    #[case(i64::MAX, Quantity::from(1))] // Default fallback for i64::MAX
+    #[case(50_000_000_000, Quantity::from("50"))] // 50.0 exactly
+    #[case(12_500_000_000, Quantity::from("12.5"))] // 12.5 exactly
+    #[case(1_000_000_000, Quantity::from("1"))] // 1.0 exactly
+    #[case(1, Quantity::from("0.000000001"))] // Smallest positive value
+    #[case(1_000_000_001, Quantity::from("1.000000001"))] // Just over 1.0
+    #[case(999_999_999, Quantity::from("0.999999999"))] // Just under 1.0
+    #[case(123_456_789_000, Quantity::from("123.456789"))] // Trailing zeros trimmed
+    fn test_decode_multiplier_precise(#[case] raw: i64, #[case] expected: Quantity) {
+        assert_eq!(decode_multiplier(raw).unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case(-1_500_000_000)] // Large negative value
+    #[case(-1)] // Small negative value
+    #[case(-999_999_999)] // Another negative value
+    fn test_decode_multiplier_negative_error(#[case] raw: i64) {
+        let result = decode_multiplier(raw);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid negative multiplier")
+        );
     }
 
     #[rstest]

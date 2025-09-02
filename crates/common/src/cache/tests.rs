@@ -750,6 +750,7 @@ fn test_pool() -> Pool {
         "Swap(address,address,int256,int256,uint160,uint128,int24)",
         "Mint(address,address,int24,int24,uint128,uint256,uint256)",
         "Burn(address,int24,int24,uint128,uint256,uint256)",
+        "Collect(address,address,int24,int24,uint128,uint128)",
     );
 
     let token0 = Token::new(
@@ -781,8 +782,8 @@ fn test_pool() -> Pool {
         12345678,
         token0,
         token1,
-        3000,
-        60,
+        Some(3000),
+        Some(60),
         UnixNanos::from(1_234_567_890_000_000_000u64),
     )
 }
@@ -821,7 +822,7 @@ fn test_pool_mut_when_some(mut cache: Cache, test_pool: Pool) {
 
     assert!(result.is_some());
     if let Some(pool_ref) = result {
-        assert_eq!(pool_ref.fee, 3000);
+        assert_eq!(pool_ref.fee.unwrap(), 3000);
     }
 }
 

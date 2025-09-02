@@ -14,23 +14,21 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_core::{
-    consts::NAUTILUS_TRADER,
-    python::{IntoPyObjectNautilusExt, to_pyvalue_err},
-    time::get_atomic_clock_realtime,
+    consts::NAUTILUS_TRADER, python::to_pyvalue_err, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::trade::TradeTick,
     enums::{OrderSide, OrderType},
-    identifiers::{ClientOrderId, Symbol, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
     instruments::InstrumentAny,
     python::instruments::{instrument_any_to_pyobject, pyobject_to_instrument_any},
     reports::{fill::FillReport, order::OrderStatusReport, position::PositionStatusReport},
     types::{price::Price, quantity::Quantity},
 };
-use pyo3::{prelude::*, types::PyList};
+use pyo3::{conversion::IntoPyObjectExt, prelude::*, types::PyList};
 
 use crate::{
-    enums::BitmexSymbolStatus,
+    common::enums::{BitmexOrderType, BitmexSide, BitmexSymbolStatus},
     http::{
         client::BitmexHttpClient,
         parse::{
@@ -38,9 +36,9 @@ use crate::{
             parse_position_report, parse_trade,
         },
         query::{
-            DeleteOrderParamsBuilder, GetExecutionParamsBuilder, GetOrderParamsBuilder,
-            GetPositionParamsBuilder, GetTradeParamsBuilder, PostOrderParamsBuilder,
-            PutOrderParamsBuilder,
+            DeleteAllOrdersParamsBuilder, DeleteOrderParamsBuilder, GetExecutionParamsBuilder,
+            GetOrderParamsBuilder, GetPositionParamsBuilder, GetTradeParamsBuilder,
+            PostOrderParamsBuilder, PutOrderParamsBuilder,
         },
     },
 };
@@ -58,16 +56,11 @@ impl BitmexHttpClient {
         // Try to use with_credentials if we have any credentials or need env vars
         if api_key.is_none() && api_secret.is_none() && !testnet && base_url.is_none() {
             // Try to load from environment
-            match BitmexHttpClient::with_credentials(
-                None,
-                None,
-                base_url.map(String::from),
-                Some(60),
-            ) {
+            match Self::with_credentials(None, None, base_url.map(String::from), Some(60)) {
                 Ok(client) => Ok(client),
                 Err(_) => {
                     // Fall back to unauthenticated client
-                    Ok(BitmexHttpClient::new(
+                    Ok(Self::new(
                         base_url.map(String::from),
                         None,
                         None,
@@ -77,7 +70,7 @@ impl BitmexHttpClient {
                 }
             }
         } else {
-            Ok(BitmexHttpClient::new(
+            Ok(Self::new(
                 base_url.map(String::from),
                 api_key.map(String::from),
                 api_secret.map(String::from),
@@ -151,11 +144,24 @@ impl BitmexHttpClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         let mut params = GetTradeParamsBuilder::default();
+        let symbol_for_precision = symbol.clone();
         if let Some(symbol) = symbol {
             params.symbol(symbol);
         }
         let params = params.build().map_err(to_pyvalue_err)?;
-        let price_precision = 1; // TBD
+        // TODO: Handle trades without symbol parameter - may need to get precision per trade
+        let price_precision = if let Some(symbol) = symbol_for_precision {
+            client.get_price_precision(&symbol).ok_or_else(|| {
+                to_pyvalue_err(anyhow::anyhow!(
+                    "Instrument {} not found in cache. Ensure instruments are loaded first.",
+                    symbol
+                ))
+            })?
+        } else {
+            // When no symbol is specified, trades from multiple instruments may be returned
+            // We'll need to handle precision per trade in the parsing loop
+            panic!("TODO: get_trades without symbol needs per-trade precision handling")
+        };
         let now = get_atomic_clock_realtime().get_time_ns();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -172,11 +178,68 @@ impl BitmexHttpClient {
             Python::with_gil(|py| {
                 let py_trades: PyResult<Vec<_>> = trades
                     .into_iter()
-                    .map(|trade| Ok(trade.into_py_any_unwrap(py)))
+                    .map(|trade| trade.into_py_any(py))
                     .collect();
                 let pylist = PyList::new(py, py_trades?).unwrap().into_any().unbind();
                 Ok(pylist)
             })
+        })
+    }
+
+    #[pyo3(name = "query_order")]
+    #[pyo3(signature = (client_order_id=None, venue_order_id=None))]
+    fn py_query_order<'py>(
+        &self,
+        py: Python<'py>,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        // Build filter to query specific order
+        let filter_json = if let Some(client_order_id) = client_order_id {
+            serde_json::json!({
+                "clOrdID": client_order_id.to_string()
+            })
+        } else if let Some(venue_order_id) = venue_order_id {
+            serde_json::json!({
+                "orderID": venue_order_id.to_string()
+            })
+        } else {
+            return Err(to_pyvalue_err(anyhow::anyhow!(
+                "Either client_order_id or venue_order_id must be provided"
+            )));
+        };
+
+        let mut params_builder = GetOrderParamsBuilder::default();
+        params_builder.filter(filter_json);
+        params_builder.count(1); // Only need one order
+        let params = params_builder.build().map_err(to_pyvalue_err)?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let resp = client.get_orders(params).await.map_err(to_pyvalue_err)?;
+
+            if resp.is_empty() {
+                return Ok(Python::with_gil(|py| py.None()));
+            }
+
+            let order = &resp[0];
+            // TODO: Properly handle missing instruments with error propagation
+            let symbol = order
+                .symbol
+                .as_deref()
+                .unwrap_or_else(|| panic!("Order missing symbol"));
+            let price_precision = client.get_price_precision(symbol).unwrap_or_else(|| {
+                panic!(
+                    "Instrument {} not found in cache. Ensure instruments are loaded first.",
+                    symbol
+                )
+            });
+
+            match parse_order_status_report(order.clone(), price_precision) {
+                Ok(report) => Python::with_gil(|py| report.into_py_any(py)),
+                Err(e) => Err(to_pyvalue_err(e)),
+            }
         })
     }
 
@@ -191,17 +254,28 @@ impl BitmexHttpClient {
         let mut params_builder = GetOrderParamsBuilder::default();
         params_builder.count(500); // Set a default count to avoid empty query
         params_builder.reverse(true); // Get newest orders first
+
         if let Some(symbol) = symbol {
             params_builder.symbol(symbol);
         }
         let params = params_builder.build().map_err(to_pyvalue_err)?;
-        let price_precision = 1; // TBD
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let resp = client.get_orders(params).await.map_err(to_pyvalue_err)?;
 
             let mut reports: Vec<OrderStatusReport> = Vec::new();
             for order in resp {
+                // TODO: Properly handle missing instruments with error propagation
+                let symbol = order
+                    .symbol
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("Order missing symbol"));
+                let price_precision = client.get_price_precision(symbol).unwrap_or_else(|| {
+                    panic!(
+                        "Instrument {} not found in cache. Ensure instruments are loaded first.",
+                        symbol
+                    )
+                });
                 match parse_order_status_report(order, price_precision) {
                     Ok(report) => reports.push(report),
                     Err(e) => tracing::error!("Failed to parse order status report: {e}"),
@@ -211,7 +285,7 @@ impl BitmexHttpClient {
             Python::with_gil(|py| {
                 let py_reports: PyResult<Vec<_>> = reports
                     .into_iter()
-                    .map(|report| Ok(report.into_py_any_unwrap(py)))
+                    .map(|report| report.into_py_any(py))
                     .collect();
                 let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
                 Ok(pylist)
@@ -230,11 +304,12 @@ impl BitmexHttpClient {
         let mut params_builder = GetExecutionParamsBuilder::default();
         params_builder.count(500); // Set a default count to avoid empty query
         params_builder.reverse(true); // Get newest fills first
+
         if let Some(symbol) = symbol {
             params_builder.symbol(symbol);
         }
+
         let params = params_builder.build().map_err(to_pyvalue_err)?;
-        let price_precision = 1; // TBD
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let resp = client
@@ -244,16 +319,34 @@ impl BitmexHttpClient {
 
             let mut reports: Vec<FillReport> = Vec::new();
             for exec in resp {
+                // TODO: Properly handle missing instruments with error propagation
+                let symbol = exec
+                    .symbol
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("Execution missing symbol"));
+                let price_precision = client.get_price_precision(symbol).unwrap_or_else(|| {
+                    panic!(
+                        "Instrument {} not found in cache. Ensure instruments are loaded first.",
+                        symbol
+                    )
+                });
                 match parse_fill_report(exec, price_precision) {
                     Ok(report) => reports.push(report),
-                    Err(e) => tracing::error!("Failed to parse fill report: {e}"),
+                    Err(e) => {
+                        // Log at debug level for skipped non-trade executions
+                        if e.to_string().starts_with("Skipping non-trade execution") {
+                            tracing::debug!("{e}");
+                        } else {
+                            tracing::error!("Failed to parse fill report: {e}");
+                        }
+                    }
                 }
             }
 
             Python::with_gil(|py| {
                 let py_reports: PyResult<Vec<_>> = reports
                     .into_iter()
-                    .map(|report| Ok(report.into_py_any_unwrap(py)))
+                    .map(|report| report.into_py_any(py))
                     .collect();
                 let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
                 Ok(pylist)
@@ -283,7 +376,7 @@ impl BitmexHttpClient {
             Python::with_gil(|py| {
                 let py_reports: PyResult<Vec<_>> = reports
                     .into_iter()
-                    .map(|report| Ok(report.into_py_any_unwrap(py)))
+                    .map(|report| report.into_py_any(py))
                     .collect();
                 let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
                 Ok(pylist)
@@ -311,23 +404,29 @@ impl BitmexHttpClient {
         params.text(NAUTILUS_TRADER);
         params.symbol(symbol.to_string());
         params.cl_ord_id(client_order_id.to_string());
-        params.ord_type(crate::enums::OrderType::from_nautilus(order_type));
-        params.side(crate::enums::Side::from_nautilus_order_side(order_side));
+        params.ord_type(BitmexOrderType::from(order_type));
+        params.side(BitmexSide::from(order_side));
         params.order_qty(quantity.as_f64() as u32); // TODO: Improve Quantity
 
         if let Some(price) = price {
             params.price(price.as_f64());
         }
+
         if let Some(trigger_price) = trigger_price {
             params.stop_px(trigger_price.as_f64());
         }
+
         if let Some(display_qty) = display_qty {
             params.display_qty(display_qty.as_f64() as u32); // TODO: Improve Quantity
         }
+
         let params = params.build().map_err(to_pyvalue_err)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client.place_order(params).await.map_err(to_pyvalue_err)?;
+            client
+                .http_place_order(params)
+                .await
+                .map_err(to_pyvalue_err)?;
             // TODO: Logging and error handling
             Ok(())
         })
@@ -352,8 +451,10 @@ impl BitmexHttpClient {
         let params = params.build().map_err(to_pyvalue_err)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client.cancel_orders(params).await.map_err(to_pyvalue_err)?;
-            // TODO: Logging and error handling
+            client
+                .http_cancel_orders(params)
+                .await
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -372,7 +473,7 @@ impl BitmexHttpClient {
             params.cl_ord_id(
                 client_order_ids
                     .iter()
-                    .map(|x| x.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect::<Vec<_>>(),
             );
         }
@@ -380,15 +481,52 @@ impl BitmexHttpClient {
             params.cl_ord_id(
                 venue_order_ids
                     .iter()
-                    .map(|x| x.to_string())
+                    .map(std::string::ToString::to_string)
                     .collect::<Vec<_>>(),
             );
         }
         let params = params.build().map_err(to_pyvalue_err)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client.cancel_orders(params).await.map_err(to_pyvalue_err)?;
+            client
+                .http_cancel_orders(params)
+                .await
+                .map_err(to_pyvalue_err)?;
             // TODO: Logging and error handling
+            Ok(())
+        })
+    }
+
+    #[pyo3(name = "cancel_all_orders")]
+    #[pyo3(signature = (instrument_id, order_side))]
+    fn py_cancel_all_orders<'py>(
+        &self,
+        py: Python<'py>,
+        instrument_id: InstrumentId,
+        order_side: OrderSide,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        let mut params = DeleteAllOrdersParamsBuilder::default();
+        params.text(NAUTILUS_TRADER);
+        params.symbol(instrument_id.symbol.to_string());
+
+        let side_str = match order_side {
+            OrderSide::Buy => "Buy",
+            OrderSide::Sell => "Sell",
+            _ => return Err(to_pyvalue_err(anyhow::anyhow!("Invalid order side"))),
+        };
+        let filter_json = serde_json::json!({
+            "side": side_str
+        });
+        params.filter(filter_json);
+
+        let params = params.build().map_err(to_pyvalue_err)?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .http_cancel_all_orders(params)
+                .await
+                .map_err(to_pyvalue_err)?;
             Ok(())
         })
     }
@@ -429,7 +567,10 @@ impl BitmexHttpClient {
         let params = params.build().map_err(to_pyvalue_err)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            client.amend_order(params).await.map_err(to_pyvalue_err)?;
+            client
+                .http_amend_order(params)
+                .await
+                .map_err(to_pyvalue_err)?;
             // TODO: Logging and error handling
             Ok(())
         })
@@ -440,5 +581,45 @@ impl BitmexHttpClient {
         let inst_any = pyobject_to_instrument_any(py, instrument)?;
         self.add_instrument(inst_any);
         Ok(())
+    }
+
+    #[pyo3(name = "http_get_margin")]
+    fn py_http_get_margin<'py>(
+        &self,
+        py: Python<'py>,
+        currency: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let margin = client
+                .http_get_margin(&currency)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::with_gil(|py| {
+                // Create a simple Python object with just the account field we need
+                // We can expand this if more fields are needed
+                let account = margin.account;
+                account.into_py_any(py)
+            })
+        })
+    }
+
+    #[pyo3(name = "request_account_state")]
+    fn py_request_account_state<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let account_state = client
+                .request_account_state(account_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+            Python::with_gil(|py| account_state.into_py_any(py).map_err(to_pyvalue_err))
+        })
     }
 }

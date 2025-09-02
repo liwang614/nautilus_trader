@@ -16,6 +16,8 @@
 from decimal import Decimal
 from typing import Any
 
+import pandas as pd
+
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.config import PositiveInt
 from nautilus_trader.config import StrategyConfig
@@ -50,6 +52,7 @@ class ExecTesterConfig(StrategyConfig, frozen=True):
 
     instrument_id: InstrumentId
     order_qty: Decimal
+    order_expire_time_delta_mins: PositiveInt | None = None
     order_params: dict[str, Any] | None = None
     client_id: ClientId | None = None
     subscribe_quotes: bool = True
@@ -62,7 +65,10 @@ class ExecTesterConfig(StrategyConfig, frozen=True):
     enable_buys: bool = True
     enable_sells: bool = True
     open_position_on_start_qty: Decimal | None = None
+    open_position_time_in_force: TimeInForce = TimeInForce.GTC
     tob_offset_ticks: PositiveInt = 500  # Definitely out of the market
+    modify_orders_to_maintain_tob_offset: bool = False
+    cancel_replace_orders_to_maintain_tob_offset: bool = False
     use_post_only: bool = True
     use_quote_quantity: bool = False
     emulation_trigger: str = "NO_TRIGGER"
@@ -75,6 +81,7 @@ class ExecTesterConfig(StrategyConfig, frozen=True):
     dry_run: bool = False
     log_data: bool = True
     test_reject_post_only: bool = False
+    can_unsubscribe: bool = True
 
 
 class ExecTester(Strategy):
@@ -110,6 +117,8 @@ class ExecTester(Strategy):
             self.stop()
             return
 
+        self.price_offset = self.get_price_offset(self.instrument)
+
         # Subscribe to live data
         if self.config.subscribe_quotes:
             self.subscribe_quote_ticks(self.config.instrument_id, client_id=self.client_id)
@@ -140,7 +149,12 @@ class ExecTester(Strategy):
                 LogColor.CYAN,
             )
 
-        self.maintain_orders(book.best_bid_price(), book.best_ask_price())
+        best_bid = book.best_bid_price()
+        best_ask = book.best_ask_price()
+        if best_bid is None or best_ask is None:
+            return  # Wait for market
+
+        self.maintain_orders(best_bid, best_ask)
 
     def on_order_book_deltas(self, deltas: OrderBookDeltas) -> None:
         """
@@ -192,35 +206,63 @@ class ExecTester(Strategy):
         if self.instrument is None or self.config.dry_run:
             return
 
-        # Maintain BUY orders
         if self.config.enable_buys:
-            if not self.buy_order or not self.is_order_active(self.buy_order):
-                market_offset = self.get_price_offset(self.instrument)
+            self.maintain_buy_orders(self.instrument, best_bid, best_ask)
 
-                if self.config.use_post_only and self.config.test_reject_post_only:
-                    price = self.instrument.make_price(best_ask + market_offset)
-                else:
-                    price = self.instrument.make_price(best_bid - market_offset)
-
-                self.submit_buy_limit_order(price)
-            # elif self.buy_order.price != best_bid:
-            #     self.cancel_order(self.buy_order)
-            #     self.create_buy_order(best_bid)
-
-        # Maintain SELL orders
         if self.config.enable_sells:
-            if not self.sell_order or not self.is_order_active(self.sell_order):
-                market_offset = self.get_price_offset(self.instrument)
+            self.maintain_sell_orders(self.instrument, best_bid, best_ask)
 
-                if self.config.use_post_only and self.config.test_reject_post_only:
-                    price = self.instrument.make_price(best_bid - market_offset)
-                else:
-                    price = self.instrument.make_price(best_ask + market_offset)
+    def maintain_buy_orders(
+        self,
+        instrument: Instrument,
+        best_bid: Price,
+        best_ask: Price,
+    ) -> None:
+        price = instrument.make_price(best_bid - self.price_offset)
 
-                self.submit_sell_limit_order(best_ask)
-            # elif self.sell_order.price != best_ask:
-            #     self.cancel_order(self.sell_order)
-            #     self.create_sell_order(best_ask)
+        if not self.buy_order or not self.is_order_active(self.buy_order):
+            if self.config.use_post_only and self.config.test_reject_post_only:
+                price = instrument.make_price(best_ask + self.price_offset)
+
+            self.submit_buy_limit_order(price)
+        elif (
+            self.buy_order
+            and self.buy_order.venue_order_id
+            and not self.buy_order.is_pending_update
+            and not self.buy_order.is_pending_cancel
+            and self.buy_order.price < price
+        ):
+            if self.config.modify_orders_to_maintain_tob_offset:
+                self.modify_order(self.buy_order, price=price)
+            elif self.config.cancel_replace_orders_to_maintain_tob_offset:
+                self.cancel_order(self.buy_order)
+                self.submit_buy_limit_order(price)
+
+    def maintain_sell_orders(
+        self,
+        instrument: Instrument,
+        best_bid: Price,
+        best_ask: Price,
+    ) -> None:
+        price = instrument.make_price(best_ask + self.price_offset)
+
+        if not self.sell_order or not self.is_order_active(self.sell_order):
+            if self.config.use_post_only and self.config.test_reject_post_only:
+                price = instrument.make_price(best_bid - self.price_offset)
+
+            self.submit_sell_limit_order(price)
+        elif (
+            self.sell_order
+            and self.sell_order.venue_order_id
+            and not self.sell_order.is_pending_update
+            and not self.sell_order.is_pending_cancel
+            and self.sell_order.price > price
+        ):
+            if self.config.modify_orders_to_maintain_tob_offset:
+                self.modify_order(self.sell_order, price=price)
+            elif self.config.cancel_replace_orders_to_maintain_tob_offset:
+                self.cancel_order(self.sell_order)
+                self.submit_sell_limit_order(price)
 
     def open_position(self, net_qty: Decimal) -> None:
         if not self.instrument:
@@ -235,6 +277,7 @@ class ExecTester(Strategy):
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY if net_qty > 0 else OrderSide.SELL,
             quantity=self.instrument.make_qty(self.config.order_qty),
+            time_in_force=self.config.open_position_time_in_force,
             quote_quantity=self.config.use_quote_quantity,
         )
 
@@ -263,13 +306,22 @@ class ExecTester(Strategy):
             self.log.warning("BUY orders not enabled, skipping")
             return
 
+        if self.config.order_expire_time_delta_mins is not None:
+            time_in_force = TimeInForce.GTD
+            expire_time = self.clock.utc_now() + pd.Timedelta(
+                minutes=self.config.order_expire_time_delta_mins,
+            )
+        else:
+            time_in_force = TimeInForce.GTC
+            expire_time = None
+
         order: LimitOrder = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.BUY,
             quantity=self.instrument.make_qty(self.config.order_qty),
             price=price,
-            # time_in_force=TimeInForce.GTD,
-            # expire_time=self.clock.utc_now() + pd.Timedelta(minutes=10),
+            time_in_force=time_in_force,
+            expire_time=expire_time,
             post_only=self.config.use_post_only,
             quote_quantity=self.config.use_quote_quantity,
             emulation_trigger=TriggerType[self.config.emulation_trigger],
@@ -295,13 +347,22 @@ class ExecTester(Strategy):
             self.log.warning("SELL orders not enabled, skipping")
             return
 
+        if self.config.order_expire_time_delta_mins is not None:
+            time_in_force = TimeInForce.GTD
+            expire_time = self.clock.utc_now() + pd.Timedelta(
+                minutes=self.config.order_expire_time_delta_mins,
+            )
+        else:
+            time_in_force = TimeInForce.GTC
+            expire_time = None
+
         order: LimitOrder = self.order_factory.limit(
             instrument_id=self.config.instrument_id,
             order_side=OrderSide.SELL,
             quantity=self.instrument.make_qty(self.config.order_qty),
             price=price,
-            # time_in_force=TimeInForce.GTD,
-            # expire_time=self.clock.utc_now() + pd.Timedelta(minutes=10),
+            time_in_force=time_in_force,
+            expire_time=expire_time,
             post_only=self.config.use_post_only,
             quote_quantity=self.config.use_quote_quantity,
             emulation_trigger=TriggerType[self.config.emulation_trigger],
@@ -324,10 +385,16 @@ class ExecTester(Strategy):
 
         if self.config.cancel_orders_on_stop:
             if self.config.use_individual_cancels_on_stop:
-                for order in self.cache.orders_open(instrument_id=self.config.instrument_id):
+                for order in self.cache.orders_open(
+                    instrument_id=self.config.instrument_id,
+                    strategy_id=self.strategy_id,
+                ):
                     self.cancel_order(order)
             elif self.config.use_batch_cancel_on_stop:
-                open_orders = self.cache.orders_open(instrument_id=self.config.instrument_id)
+                open_orders = self.cache.orders_open(
+                    instrument_id=self.config.instrument_id,
+                    strategy_id=self.strategy_id,
+                )
                 if open_orders:
                     self.cancel_orders(open_orders, client_id=self.client_id)
             else:
@@ -341,15 +408,16 @@ class ExecTester(Strategy):
                 reduce_only=self.config.reduce_only_on_stop,
             )
 
-        # Unsubscribe from data
-        if self.config.subscribe_quotes:
-            self.unsubscribe_quote_ticks(self.config.instrument_id, client_id=self.client_id)
+        # Unsubscribe from data (if supported)
+        if self.config.can_unsubscribe:
+            if self.config.subscribe_quotes:
+                self.unsubscribe_quote_ticks(self.config.instrument_id, client_id=self.client_id)
 
-        if self.config.subscribe_trades:
-            self.unsubscribe_trade_ticks(self.config.instrument_id, client_id=self.client_id)
+            if self.config.subscribe_trades:
+                self.unsubscribe_trade_ticks(self.config.instrument_id, client_id=self.client_id)
 
-        if self.config.subscribe_book:
-            self.unsubscribe_order_book_at_interval(
-                self.config.instrument_id,
-                client_id=self.client_id,
-            )
+            if self.config.subscribe_book:
+                self.unsubscribe_order_book_at_interval(
+                    self.config.instrument_id,
+                    client_id=self.client_id,
+                )

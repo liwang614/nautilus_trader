@@ -48,6 +48,7 @@ pub enum NautilusWsMessage {
     ExecutionReports(Vec<ExecutionReport>),
     Error(OKXWebSocketError),
     Raw(serde_json::Value), // Unhandled channels
+    Reconnected,
 }
 
 /// Represents an OKX WebSocket error.
@@ -80,8 +81,30 @@ pub struct OKXWsRequest<T> {
     pub id: Option<String>,
     /// Operation type (order, cancel-order, amend-order).
     pub op: OKXWsOperation,
+    /// Request effective deadline. Unix timestamp format in milliseconds.
+    /// This is when the request itself expires, not related to order expiration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "expTime")]
+    pub exp_time: Option<String>,
     /// Arguments payload for the operation.
     pub args: Vec<T>,
+}
+
+/// OKX WebSocket authentication message.
+#[derive(Debug, Serialize)]
+pub struct OKXAuthentication {
+    pub op: &'static str,
+    pub args: Vec<OKXAuthenticationArg>,
+}
+
+/// OKX WebSocket authentication arguments.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OKXAuthenticationArg {
+    pub api_key: String,
+    pub passphrase: String,
+    pub timestamp: String,
+    pub sign: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,16 +125,16 @@ pub struct OKXSubscriptionArg {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum OKXWebSocketEvent {
-    Subscription {
-        event: OKXSubscriptionEvent,
-        arg: OKXWebSocketArg,
-        #[serde(rename = "connId")]
-        conn_id: String,
-    },
     Login {
         event: String,
         code: String,
         msg: String,
+        #[serde(rename = "connId")]
+        conn_id: String,
+    },
+    Subscription {
+        event: OKXSubscriptionEvent,
+        arg: OKXWebSocketArg,
         #[serde(rename = "connId")]
         conn_id: String,
     },
@@ -143,6 +166,8 @@ pub enum OKXWebSocketEvent {
         code: String,
         msg: String,
     },
+    #[serde(skip)]
+    Reconnected,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -574,12 +599,6 @@ pub struct WsCancelOrderParams {
     /// User-assigned client order ID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cl_ord_id: Option<String>,
-    /// Position side: long, short, net (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pos_side: Option<OKXPositionSide>,
-    /// Margin currency (only for margin trades).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ccy: Option<String>,
 }
 
 /// Parameters for WebSocket amend order operation (instType not included).
@@ -601,16 +620,10 @@ pub struct WsAmendOrderParams {
     pub new_cl_ord_id: Option<String>,
     /// New order price (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub px: Option<String>,
+    pub new_px: Option<String>,
     /// New order size (optional).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sz: Option<String>,
-    /// Position side: long, short, net (optional).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pos_side: Option<OKXPositionSide>,
-    /// Margin currency (only for margin trades).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ccy: Option<String>,
+    pub new_sz: Option<String>,
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -630,14 +643,8 @@ mod tests {
         let result: Result<OKXWebSocketArg, _> = serde_json::from_str(json_str);
         match result {
             Ok(arg) => {
-                assert_eq!(
-                    arg.channel,
-                    crate::websocket::enums::OKXWsChannel::Instruments
-                );
-                assert_eq!(
-                    arg.inst_type,
-                    Some(crate::common::enums::OKXInstrumentType::Spot)
-                );
+                assert_eq!(arg.channel, OKXWsChannel::Instruments);
+                assert_eq!(arg.inst_type, Some(OKXInstrumentType::Spot));
                 assert_eq!(arg.inst_id, None);
             }
             Err(e) => {
@@ -662,10 +669,7 @@ mod tests {
         match result {
             Ok(msg) => {
                 assert_eq!(msg.event, "subscribe");
-                assert_eq!(
-                    msg.arg.channel,
-                    crate::websocket::enums::OKXWsChannel::Instruments
-                );
+                assert_eq!(msg.arg.channel, OKXWsChannel::Instruments);
                 assert_eq!(msg.conn_id, "380cfa6a");
             }
             Err(e) => {
@@ -728,9 +732,6 @@ mod tests {
 
     #[rstest]
     fn test_channel_serialization_for_logging() {
-        // Test that we can serialize channel enums to their string representations for logging
-        use crate::websocket::enums::OKXWsChannel;
-
         let channel = OKXWsChannel::Candle1Minute;
         let serialized = serde_json::to_string(&channel).unwrap();
         let cleaned = serialized.trim_matches('"').to_string();
@@ -940,7 +941,7 @@ mod tests {
                 assert_eq!(msg, "Login successful");
                 assert_eq!(conn_id, "a4d3ae55");
             }
-            _ => panic!("Expected Login variant"),
+            _ => panic!("Expected Login variant, got: {:?}", parsed),
         }
     }
 
@@ -974,6 +975,7 @@ mod tests {
                 "ordType": "market",
                 "sz": "0.1"
             })],
+            exp_time: None,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
@@ -1233,6 +1235,7 @@ mod tests {
                 "ordType": "market",
                 "sz": "0.1"
             })],
+            exp_time: None,
         };
 
         let serialized = serde_json::to_string(&request).unwrap();
